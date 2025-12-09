@@ -1,14 +1,14 @@
+import os
 import re
-import io
+import glob
 from typing import List, Dict, Optional, Tuple
 
-import streamlit as st
 import pandas as pd
 from PyPDF2 import PdfReader
 
-# --------------------------------------------------------------------
-# 1. Alcorn header (same as Headeralcron.xlsx)
-# --------------------------------------------------------------------
+# ================================================================
+# 1. ALCORN HEADER (MUST MATCH YOUR HEADER SHEET)
+# ================================================================
 HEADER_COLUMNS: List[str] = [
     "ReferralManagerCode",
     "ReferralManager",
@@ -56,83 +56,93 @@ HEADER_COLUMNS: List[str] = [
 
 BRAND_NAME = "Alcorn Industrial Inc"
 
+# ================================================================
+# 2. REGEX PATTERNS
+# ================================================================
 DATE_PATTERN = re.compile(
     r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},\s+\d{4}"
 )
 MONEY_RE = re.compile(r"^[0-9,]*\d\.\d{2}$")
 QUOTE_NO_RE = re.compile(r"(QT\d{6}|RQ\d{4,}-\d+)", re.IGNORECASE)
 
-# --------------------------------------------------------------------
-# 2. Header extraction helpers
-# --------------------------------------------------------------------
+
+# ================================================================
+# 3. HEADER FIELD EXTRACTION
+# ================================================================
 def extract_quote_number(page_text: str) -> Optional[str]:
+    """QT000171 / RQ7289-36 etc."""
     m = QUOTE_NO_RE.search(page_text)
     return m.group(1).upper() if m else None
 
 
 def extract_quote_date(page_text: str) -> Optional[str]:
+    """Example: Nov 21, 2025"""
     m = DATE_PATTERN.search(page_text)
     return m.group(0) if m else None
 
 
 def extract_customer_and_salesperson(page_text: str, quote_no: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
     """
-    Best-effort:
-      - For RQ: often on RFQ line
-      - For QT: either in compact line or explicit 'Customer No' line
+    Map to:
+        Customer Number/ID  -> your Excel column
+        ReferralManagerCode -> salesperson code (CR, MM, SVC, 11, etc.)
+
+    This is tuned for Alcorn quotes you showed:
+    - QT: compact line with "2109 CR UPS1 NET30 QT00040379"
+    - RQ: RFQ line with cust + salesperson
+    - Fallback: explicit 'Customer No' text
     """
     cust = None
     sp = None
 
-    if not quote_no:
-        # Try generic "Customer No" pattern anyway
-        m_cust = re.search(r"Customer\s+No\.?\s*:?[\s#]*([0-9A-Z\-]+)", page_text, re.IGNORECASE)
-        if m_cust:
-            cust = m_cust.group(1)
-        return cust, sp
+    # Fallback: explicit "Customer No"
+    def fallback_customer(text: str) -> Optional[str]:
+        mc = re.search(r"Customer\s+No\.?\s*:?[\s#]*([0-9A-Z\-]+)", text, re.IGNORECASE)
+        return mc.group(1) if mc else None
 
-    # 1) RQ style: RFQ line
+    if not quote_no:
+        return fallback_customer(page_text), None
+
     if quote_no.startswith("RQ"):
+        # RFQ line pattern for repair quotes
         m = re.search(r"RFQ\s+\S+\s+([0-9A-Z\-]+)\s+([A-Z0-9]{1,3})\s+[A-Z]", page_text)
         if m:
             cust, sp = m.group(1), m.group(2)
     else:
-        # 2) QT style compact header line
+        # QT compact header: "2109 CR UPS1 NET30 QT00040379"
         pattern = rf"\n([0-9A-Z\-]+)\s+([A-Z0-9]{{1,3}})\s+[A-Z0-9]+\s+[A-Z0-9]+\s+{re.escape(quote_no)}"
         m = re.search(pattern, page_text)
         if m:
             cust, sp = m.group(1), m.group(2)
 
-    # 3) Fallback: explicit "Customer No"
     if not cust:
-        m_cust = re.search(r"Customer\s+No\.?\s*:?[\s#]*([0-9A-Z\-]+)", page_text, re.IGNORECASE)
-        if m_cust:
-            cust = m_cust.group(1)
+        cust = fallback_customer(page_text)
 
     return cust, sp
 
 
 def extract_company_block(page_text: str):
     """
-    Pulls Company, Address, City, State, ZipCode, Country from the Ship To block.
-    Tries both 'Ship To :' and 'Ship to:' variants.
+    Map to:
+        Company, Address, City, State, ZipCode, Country
+
+    Based on 'Ship To' block in the quote.
+    Handles 'Ship To :' / 'Ship to:' etc.
     """
-    # Normalize to handle "Ship to" / "Ship To"
-    lower = page_text.lower()
-    idx = lower.find("ship to")
+    text_lower = page_text.lower()
+    idx = text_lower.find("ship to")
     if idx == -1:
         return None, None, None, None, None, None
 
-    # Start from 'Ship To' and take next few lines
     tail = page_text[idx:]
     lines = tail.splitlines()[1:10]  # skip the "Ship To" line itself
     lines = [ln.strip() for ln in lines if ln.strip()]
     if not lines:
         return None, None, None, None, None, None
 
-    # Country line
-    country_line = None
+    # Country
     country = None
+    country_line = None
     for ln in reversed(lines):
         if "Canada" in ln:
             country = "Canada"
@@ -143,15 +153,13 @@ def extract_company_block(page_text: str):
             country_line = ln
             break
 
-    # City / State / Zip line
+    # City / State / Zip
     city = state = zipcode = None
     cs_line = None
     for ln in lines:
-        if "," in ln:
-            # Rough heuristic for city/state
-            if re.search(r"\s[A-Z]{2}\s+\S+", ln):
-                cs_line = ln
-                break
+        if "," in ln and re.search(r"\s[A-Z]{2}\s+\S+", ln):
+            cs_line = ln
+            break
 
     if cs_line:
         parts = cs_line.split(",")
@@ -163,7 +171,7 @@ def extract_company_block(page_text: str):
         if len(rest_tokens) > 1:
             zipcode = " ".join(rest_tokens[1:])
 
-    # Address line (street with digits) before city/state line
+    # Address (street with digits) above city/state line
     address = None
     if cs_line:
         idx_cs = lines.index(cs_line)
@@ -172,7 +180,7 @@ def extract_company_block(page_text: str):
                 address = ln
                 break
 
-    # Company: first non-empty non-address/non-city/country
+    # Company: first non-address/non-city/country line
     company = None
     for ln in lines:
         if ln in (cs_line, country_line, address):
@@ -182,7 +190,7 @@ def extract_company_block(page_text: str):
         company = ln
         break
 
-    # Infer country if missing
+    # Country default rules
     if country is None and state in ("QC", "ON"):
         country = "Canada"
     if country is None:
@@ -191,10 +199,19 @@ def extract_company_block(page_text: str):
     return company, address, city, state, zipcode, country
 
 
-# --------------------------------------------------------------------
-# 3. Line item parsing
-# --------------------------------------------------------------------
+# ================================================================
+# 4. LINE ITEM PARSING
+# ================================================================
 def parse_line_item(line: str) -> Optional[Dict]:
+    """
+    Map to:
+        Quantity, item_id, item_desc, UOM, Unit Price, TotalSales
+
+    Assumes line format near:
+        QTY [ITEM_ID ... DESCRIPTION ...] UNIT_PRICE UOM TOTAL
+    Example:
+        2 QXXD5AT080ES08 80Nm Angle Tool BT/Wireless ETS 8,222.00 EA 16,444.00
+    """
     s = line.strip()
     if not s:
         return None
@@ -204,8 +221,8 @@ def parse_line_item(line: str) -> Optional[Dict]:
     if len(money_idxs) < 2:
         return None
 
-    i2 = money_idxs[-1]     # total
-    i1 = money_idxs[-2]     # unit
+    i2 = money_idxs[-1]   # total
+    i1 = money_idxs[-2]   # unit
 
     try:
         unit_price = float(tokens[i1].replace(",", ""))
@@ -213,20 +230,19 @@ def parse_line_item(line: str) -> Optional[Dict]:
     except ValueError:
         return None
 
-    # quantity at start
+    # quantity (leading int)
     qty_idxs = []
     for i, t in enumerate(tokens):
         if t.isdigit():
             qty_idxs.append(i)
         else:
             break
-
     if not qty_idxs:
         return None
 
     qty = int(tokens[qty_idxs[0]])
 
-    # tokens between qty block and unit price
+    # text between qty block and unit price
     start_body = qty_idxs[-1] + 1
     end_body = i1 - 1
     if start_body > end_body:
@@ -234,18 +250,18 @@ def parse_line_item(line: str) -> Optional[Dict]:
 
     body_tokens = tokens[start_body:end_body + 1]
 
-    # UOM between unit price and total
+    # UOM (between unit price and total)
     uom_tokens = tokens[i1 + 1:i2]
     uom = " ".join(uom_tokens) if uom_tokens else None
 
-    # Clean weird leading zeros
+    # Clean random leading "0" in body (like "1 0 1 DYNA 95600 KIT...")
     while body_tokens and body_tokens[0] == "0":
         body_tokens = body_tokens[1:]
 
     if not body_tokens:
         return None
 
-    # You can tweak this if you want item_id to include 2 tokens instead of 1
+    # MAP: item_id = first token, rest = description
     item_id = body_tokens[0]
     item_desc = " ".join(body_tokens[1:]) if len(body_tokens) > 1 else ""
 
@@ -260,19 +276,12 @@ def parse_line_item(line: str) -> Optional[Dict]:
     }
 
 
-# --------------------------------------------------------------------
-# 4. Process one uploaded PDF
-# --------------------------------------------------------------------
-def process_pdf_file(uploaded_file, debug_collect: bool = False):
+# ================================================================
+# 5. PROCESS A SINGLE PDF INTO ROWS
+# ================================================================
+def process_pdf(pdf_path: str) -> List[Dict]:
     rows: List[Dict] = []
-    debug_data = {
-        "pages": [],
-        "first_quote": None,
-        "first_company_block": None,
-        "first_items": [],
-    }
-
-    reader = PdfReader(uploaded_file)
+    reader = PdfReader(pdf_path)
     num_pages = len(reader.pages)
 
     current_quote_no = None
@@ -290,7 +299,7 @@ def process_pdf_file(uploaded_file, debug_collect: bool = False):
         page = reader.pages[page_idx]
         text = page.extract_text() or ""
 
-        # header detection
+        # detect quote header (QT / RQ)
         q_no = extract_quote_number(text)
         if q_no:
             current_quote_no = q_no
@@ -303,28 +312,10 @@ def process_pdf_file(uploaded_file, debug_collect: bool = False):
              current_zip,
              current_country) = extract_company_block(text)
 
-            if debug_collect and debug_data["first_quote"] is None:
-                debug_data["first_quote"] = {
-                    "quote_no": current_quote_no,
-                    "quote_date": current_quote_date,
-                    "customer_no": current_cust_no,
-                    "salesperson": current_sp,
-                }
-                debug_data["first_company_block"] = {
-                    "company": current_company,
-                    "address": current_address,
-                    "city": current_city,
-                    "state": current_state,
-                    "zip": current_zip,
-                    "country": current_country,
-                }
-
-        if debug_collect:
-            debug_data["pages"].append(text[:2000])  # first 2000 chars per page
-
         if not current_quote_no:
-            continue
+            continue  # skip pages before we know the quote #
 
+        # locate line items between "Please send your order to:" and "Tax Summary"
         lines = text.splitlines()
         in_items = False
 
@@ -342,19 +333,18 @@ def process_pdf_file(uploaded_file, debug_collect: bool = False):
             if not parsed:
                 continue
 
-            if debug_collect and len(debug_data["first_items"]) < 10:
-                debug_data["first_items"].append(
-                    {"raw": parsed["raw"], "parsed": parsed}
-                )
-
             row = {h: None for h in HEADER_COLUMNS}
+
+            # ---- MAP HEADER FIELDS ----
             row["Brand"] = BRAND_NAME
             row["QuoteNumber"] = current_quote_no
             row["QuoteDate"] = current_quote_date
+
             if current_cust_no:
                 row["Customer Number/ID"] = current_cust_no
             if current_sp:
                 row["ReferralManagerCode"] = current_sp
+
             if current_company:
                 row["Company"] = current_company
             if current_address:
@@ -368,106 +358,53 @@ def process_pdf_file(uploaded_file, debug_collect: bool = False):
             if current_country:
                 row["Country"] = current_country
 
+            # ---- MAP LINE ITEM FIELDS ----
             row["item_id"] = parsed["item_id"]
             row["item_desc"] = parsed["item_desc"]
             row["UOM"] = parsed["UOM"]
             row["Quantity"] = parsed["Quantity"]
             row["Unit Price"] = parsed["UnitPrice"]
             row["TotalSales"] = parsed["TotalSales"]
-            row["PDF"] = uploaded_file.name
+
+            # link back to source file
+            row["PDF"] = os.path.basename(pdf_path)
 
             rows.append(row)
 
-    return rows, debug_data if debug_collect else None
+    return rows
 
 
-# --------------------------------------------------------------------
-# 5. Streamlit UI
-# --------------------------------------------------------------------
+# ================================================================
+# 6. MAIN: PROCESS ALL PDFS IN A FOLDER
+# ================================================================
 def main():
-    st.title("Alcorn Quote PDF → Excel Converter")
+    input_folder = "input_pdfs"   # put your PDFs here
+    output_folder = "output"
+    os.makedirs(output_folder, exist_ok=True)
 
-    st.write(
-        """
-        Upload one or more **Alcorn quote PDFs** (QT / RQ).
-        This app will extract:
-        - QuoteNumber & QuoteDate
-        - Customer Number / Company / Address / City / State / Zip / Country
-        - All line items with Quantity, Unit Price, TotalSales
-        into a single Excel file using your Alcorn header.
-        """
-    )
+    pdf_files = sorted(glob.glob(os.path.join(input_folder, "*.pdf")))
+    if not pdf_files:
+        print(f"[!] No PDFs found in {input_folder}/")
+        return
 
-    with st.sidebar:
-        st.header("Debug options")
-        debug_mode = st.checkbox(
-            "Show debug info for first PDF",
-            value=True,
-            help="Shows what the parser sees: quote header, company block, and first item lines.",
-        )
+    all_rows: List[Dict] = []
 
-    uploaded_files = st.file_uploader(
-        "Upload PDF quote files",
-        type=["pdf"],
-        accept_multiple_files=True,
-    )
+    for pdf_path in pdf_files:
+        print(f"[+] Processing: {os.path.basename(pdf_path)}")
+        try:
+            rows = process_pdf(pdf_path)
+            all_rows.extend(rows)
+        except Exception as e:
+            print(f"    ERROR on {pdf_path}: {e}")
 
-    default_filename = "Alcorn_Quotes_Merged.xlsx"
-    output_filename = st.text_input(
-        "Output Excel filename",
-        value=default_filename,
-    )
+    if not all_rows:
+        print("[!] No line items found in any PDF.")
+        return
 
-    if st.button("Process PDFs to Excel"):
-        if not uploaded_files:
-            st.warning("Please upload at least one PDF file.")
-            return
-
-        all_rows: List[Dict] = []
-        first_debug = None
-
-        with st.spinner("Processing PDFs..."):
-            for idx, f in enumerate(uploaded_files):
-                st.write(f"Processing: **{f.name}**")
-                rows, dbg = process_pdf_file(f, debug_collect=(debug_mode and idx == 0))
-                all_rows.extend(rows)
-                if dbg and first_debug is None:
-                    first_debug = dbg
-
-        if not all_rows:
-            st.error("No line items were found in the uploaded PDFs.")
-            return
-
-        df = pd.DataFrame(all_rows, columns=HEADER_COLUMNS)
-        st.success(f"Extracted {len(df)} rows from {len(uploaded_files)} PDF(s).")
-
-        st.subheader("Preview of extracted data")
-        st.dataframe(df.head(100))
-
-        # Debug info
-        if debug_mode and first_debug:
-            st.subheader("Debug: First PDF parsing details")
-            st.markdown("**Detected first quote header:**")
-            st.json(first_debug.get("first_quote"))
-
-            st.markdown("**Detected Ship To (company block):**")
-            st.json(first_debug.get("first_company_block"))
-
-            st.markdown("**Sample parsed line items (first 10):**")
-            st.json(first_debug.get("first_items"))
-
-        # Excel download
-        buffer = io.BytesIO()
-        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name="Quotes")
-        buffer.seek(0)
-
-        st.download_button(
-            label="Download Excel file",
-            data=buffer,
-            file_name=output_filename or default_filename,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+    df = pd.DataFrame(all_rows, columns=HEADER_COLUMNS)
+    out_path = os.path.join(output_folder, "Alcorn_Quotes_Merged.xlsx")
+    df.to_excel(out_path, index=False)
+    print(f"[✓] Done. Wrote {len(df)} rows to {out_path}")
 
 
 if __name__ == "__main__":
