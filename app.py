@@ -1,7 +1,6 @@
-import os
 import re
 import io
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 import streamlit as st
 import pandas as pd
@@ -57,22 +56,18 @@ HEADER_COLUMNS: List[str] = [
 
 BRAND_NAME = "Alcorn Industrial Inc"
 
-# --------------------------------------------------------------------
-# 2. Regex patterns for header info & money
-# --------------------------------------------------------------------
 DATE_PATTERN = re.compile(
     r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},\s+\d{4}"
 )
 MONEY_RE = re.compile(r"^[0-9,]*\d\.\d{2}$")
-QUOTE_NO_RE = re.compile(r"(QT\d{6}|RQ\d{4,}-\d+)")
-
+QUOTE_NO_RE = re.compile(r"(QT\d{6}|RQ\d{4,}-\d+)", re.IGNORECASE)
 
 # --------------------------------------------------------------------
-# 3. Helpers to parse header info
+# 2. Header extraction helpers
 # --------------------------------------------------------------------
 def extract_quote_number(page_text: str) -> Optional[str]:
     m = QUOTE_NO_RE.search(page_text)
-    return m.group(1) if m else None
+    return m.group(1).upper() if m else None
 
 
 def extract_quote_date(page_text: str) -> Optional[str]:
@@ -80,44 +75,58 @@ def extract_quote_date(page_text: str) -> Optional[str]:
     return m.group(0) if m else None
 
 
-def extract_customer_and_salesperson(page_text: str, quote_no: str) -> (Optional[str], Optional[str]):
+def extract_customer_and_salesperson(page_text: str, quote_no: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
     """
-    Best-effort: get Customer Number/ID and ReferralManagerCode from the top area of the quote.
-    Works for both QT and RQ styles you've shown.
+    Best-effort:
+      - For RQ: often on RFQ line
+      - For QT: either in compact line or explicit 'Customer No' line
     """
     cust = None
     sp = None
 
     if not quote_no:
+        # Try generic "Customer No" pattern anyway
+        m_cust = re.search(r"Customer\s+No\.?\s*:?[\s#]*([0-9A-Z\-]+)", page_text, re.IGNORECASE)
+        if m_cust:
+            cust = m_cust.group(1)
         return cust, sp
 
-    # Repair quotes often have RFQ line: "RFQ <...> 2109 SVC ..."
+    # 1) RQ style: RFQ line
     if quote_no.startswith("RQ"):
         m = re.search(r"RFQ\s+\S+\s+([0-9A-Z\-]+)\s+([A-Z0-9]{1,3})\s+[A-Z]", page_text)
         if m:
             cust, sp = m.group(1), m.group(2)
     else:
-        # Normal QT: line like "2109 CR UPS1 NET30 QT00040379"
-        pattern = rf"\n([0-9A-Z\-]+)\s+([A-Z0-9]{{1,3}})\s+[A-Z0-9]+\s+[A-Z0-9]+\s+{quote_no}"
+        # 2) QT style compact header line
+        pattern = rf"\n([0-9A-Z\-]+)\s+([A-Z0-9]{{1,3}})\s+[A-Z0-9]+\s+[A-Z0-9]+\s+{re.escape(quote_no)}"
         m = re.search(pattern, page_text)
         if m:
             cust, sp = m.group(1), m.group(2)
+
+    # 3) Fallback: explicit "Customer No"
+    if not cust:
+        m_cust = re.search(r"Customer\s+No\.?\s*:?[\s#]*([0-9A-Z\-]+)", page_text, re.IGNORECASE)
+        if m_cust:
+            cust = m_cust.group(1)
 
     return cust, sp
 
 
 def extract_company_block(page_text: str):
     """
-    Pulls Company, Address, City, State, ZipCode, Country from the Ship To: block.
-    This matches the quote PDFs you've shared.
+    Pulls Company, Address, City, State, ZipCode, Country from the Ship To block.
+    Tries both 'Ship To :' and 'Ship to:' variants.
     """
-    pos = page_text.find("Ship To :")
-    if pos == -1:
+    # Normalize to handle "Ship to" / "Ship To"
+    lower = page_text.lower()
+    idx = lower.find("ship to")
+    if idx == -1:
         return None, None, None, None, None, None
 
-    # Grab next ~9 lines after 'Ship To :'
-    block = page_text[pos:].splitlines()[1:10]
-    lines = [ln.strip() for ln in block if ln.strip()]
+    # Start from 'Ship To' and take next few lines
+    tail = page_text[idx:]
+    lines = tail.splitlines()[1:10]  # skip the "Ship To" line itself
+    lines = [ln.strip() for ln in lines if ln.strip()]
     if not lines:
         return None, None, None, None, None, None
 
@@ -138,16 +147,11 @@ def extract_company_block(page_text: str):
     city = state = zipcode = None
     cs_line = None
     for ln in lines:
-        if "," in ln and any(st in ln for st in [
-            " AL ", " AK ", " AZ ", " AR ", " CA ", " CO ", " CT ", " DE ", " FL ", " GA ",
-            " HI ", " IA ", " ID ", " IL ", " IN ", " KS ", " KY ", " LA ", " MA ", " MD ",
-            " ME ", " MI ", " MN ", " MO ", " MS ", " MT ", " NC ", " ND ", " NE ", " NH ",
-            " NJ ", " NM ", " NV ", " NY ", " OH ", " OK ", " OR ", " PA ", " RI ", " SC ",
-            " SD ", " TN ", " TX ", " UT ", " VA ", " VT ", " WA ", " WI ", " WV ", " WY ",
-            " QC ", " ON "
-        ]):
-            cs_line = ln
-            break
+        if "," in ln:
+            # Rough heuristic for city/state
+            if re.search(r"\s[A-Z]{2}\s+\S+", ln):
+                cs_line = ln
+                break
 
     if cs_line:
         parts = cs_line.split(",")
@@ -168,7 +172,7 @@ def extract_company_block(page_text: str):
                 address = ln
                 break
 
-    # Company line – first non-empty, non-address, non-city/country
+    # Company: first non-empty non-address/non-city/country
     company = None
     for ln in lines:
         if ln in (cs_line, country_line, address):
@@ -188,14 +192,9 @@ def extract_company_block(page_text: str):
 
 
 # --------------------------------------------------------------------
-# 4. Parse line items from text lines
+# 3. Line item parsing
 # --------------------------------------------------------------------
 def parse_line_item(line: str) -> Optional[Dict]:
-    """
-    Parse one line that contains a line item.
-    Assumes format like:
-        "1  QXXD5AT080ES08 80Nm Angle Tool BT/Wireless ETS  8,222.00 EA 8,222.00"
-    """
     s = line.strip()
     if not s:
         return None
@@ -203,7 +202,7 @@ def parse_line_item(line: str) -> Optional[Dict]:
     tokens = s.split()
     money_idxs = [i for i, t in enumerate(tokens) if MONEY_RE.match(t)]
     if len(money_idxs) < 2:
-        return None  # need unit price + total
+        return None
 
     i2 = money_idxs[-1]     # total
     i1 = money_idxs[-2]     # unit
@@ -214,38 +213,41 @@ def parse_line_item(line: str) -> Optional[Dict]:
     except ValueError:
         return None
 
-    # leading quantity
+    # quantity at start
     qty_idxs = []
     for i, t in enumerate(tokens):
         if t.isdigit():
             qty_idxs.append(i)
         else:
             break
+
     if not qty_idxs:
         return None
 
     qty = int(tokens[qty_idxs[0]])
 
-    # body tokens between qty and unit price
+    # tokens between qty block and unit price
     start_body = qty_idxs[-1] + 1
     end_body = i1 - 1
     if start_body > end_body:
         return None
+
     body_tokens = tokens[start_body:end_body + 1]
 
-    # UOM tokens between unit and total
+    # UOM between unit price and total
     uom_tokens = tokens[i1 + 1:i2]
     uom = " ".join(uom_tokens) if uom_tokens else None
 
-    # Special case: sometimes you get "1 0 1 DYNA 95600 KIT..."
+    # Clean weird leading zeros
     while body_tokens and body_tokens[0] == "0":
         body_tokens = body_tokens[1:]
 
     if not body_tokens:
         return None
 
+    # You can tweak this if you want item_id to include 2 tokens instead of 1
     item_id = body_tokens[0]
-    item_desc = " ".join(body_tokens[1:]) if len(body_tokens) > 1 else None
+    item_desc = " ".join(body_tokens[1:]) if len(body_tokens) > 1 else ""
 
     return {
         "Quantity": qty,
@@ -259,12 +261,17 @@ def parse_line_item(line: str) -> Optional[Dict]:
 
 
 # --------------------------------------------------------------------
-# 5. Process a single uploaded PDF file into rows
+# 4. Process one uploaded PDF
 # --------------------------------------------------------------------
-def process_pdf_file(uploaded_file) -> List[Dict]:
+def process_pdf_file(uploaded_file, debug_collect: bool = False):
     rows: List[Dict] = []
+    debug_data = {
+        "pages": [],
+        "first_quote": None,
+        "first_company_block": None,
+        "first_items": [],
+    }
 
-    # uploaded_file is a BytesIO-like object
     reader = PdfReader(uploaded_file)
     num_pages = len(reader.pages)
 
@@ -283,7 +290,7 @@ def process_pdf_file(uploaded_file) -> List[Dict]:
         page = reader.pages[page_idx]
         text = page.extract_text() or ""
 
-        # If this page has a new quote number, refresh header info
+        # header detection
         q_no = extract_quote_number(text)
         if q_no:
             current_quote_no = q_no
@@ -296,7 +303,25 @@ def process_pdf_file(uploaded_file) -> List[Dict]:
              current_zip,
              current_country) = extract_company_block(text)
 
-        # If we still don't have a quote number, skip this page
+            if debug_collect and debug_data["first_quote"] is None:
+                debug_data["first_quote"] = {
+                    "quote_no": current_quote_no,
+                    "quote_date": current_quote_date,
+                    "customer_no": current_cust_no,
+                    "salesperson": current_sp,
+                }
+                debug_data["first_company_block"] = {
+                    "company": current_company,
+                    "address": current_address,
+                    "city": current_city,
+                    "state": current_state,
+                    "zip": current_zip,
+                    "country": current_country,
+                }
+
+        if debug_collect:
+            debug_data["pages"].append(text[:2000])  # first 2000 chars per page
+
         if not current_quote_no:
             continue
 
@@ -316,6 +341,11 @@ def process_pdf_file(uploaded_file) -> List[Dict]:
             parsed = parse_line_item(line)
             if not parsed:
                 continue
+
+            if debug_collect and len(debug_data["first_items"]) < 10:
+                debug_data["first_items"].append(
+                    {"raw": parsed["raw"], "parsed": parsed}
+                )
 
             row = {h: None for h in HEADER_COLUMNS}
             row["Brand"] = BRAND_NAME
@@ -348,21 +378,33 @@ def process_pdf_file(uploaded_file) -> List[Dict]:
 
             rows.append(row)
 
-    return rows
+    return rows, debug_data if debug_collect else None
 
 
 # --------------------------------------------------------------------
-# 6. Streamlit UI
+# 5. Streamlit UI
 # --------------------------------------------------------------------
 def main():
     st.title("Alcorn Quote PDF → Excel Converter")
+
     st.write(
         """
         Upload one or more **Alcorn quote PDFs** (QT / RQ).
-        I will extract all line items and customer details into a single Excel file
-        with your standard Alcorn header.
+        This app will extract:
+        - QuoteNumber & QuoteDate
+        - Customer Number / Company / Address / City / State / Zip / Country
+        - All line items with Quantity, Unit Price, TotalSales
+        into a single Excel file using your Alcorn header.
         """
     )
+
+    with st.sidebar:
+        st.header("Debug options")
+        debug_mode = st.checkbox(
+            "Show debug info for first PDF",
+            value=True,
+            help="Shows what the parser sees: quote header, company block, and first item lines.",
+        )
 
     uploaded_files = st.file_uploader(
         "Upload PDF quote files",
@@ -374,7 +416,6 @@ def main():
     output_filename = st.text_input(
         "Output Excel filename",
         value=default_filename,
-        help="This will be the name of the downloaded .xlsx file.",
     )
 
     if st.button("Process PDFs to Excel"):
@@ -383,15 +424,15 @@ def main():
             return
 
         all_rows: List[Dict] = []
+        first_debug = None
 
         with st.spinner("Processing PDFs..."):
-            for f in uploaded_files:
+            for idx, f in enumerate(uploaded_files):
                 st.write(f"Processing: **{f.name}**")
-                try:
-                    rows = process_pdf_file(f)
-                    all_rows.extend(rows)
-                except Exception as e:
-                    st.error(f"Error processing {f.name}: {e}")
+                rows, dbg = process_pdf_file(f, debug_collect=(debug_mode and idx == 0))
+                all_rows.extend(rows)
+                if dbg and first_debug is None:
+                    first_debug = dbg
 
         if not all_rows:
             st.error("No line items were found in the uploaded PDFs.")
@@ -401,13 +442,24 @@ def main():
         st.success(f"Extracted {len(df)} rows from {len(uploaded_files)} PDF(s).")
 
         st.subheader("Preview of extracted data")
-        st.dataframe(df.head(100))  # show top 100 rows
+        st.dataframe(df.head(100))
 
-        # Create Excel in memory
+        # Debug info
+        if debug_mode and first_debug:
+            st.subheader("Debug: First PDF parsing details")
+            st.markdown("**Detected first quote header:**")
+            st.json(first_debug.get("first_quote"))
+
+            st.markdown("**Detected Ship To (company block):**")
+            st.json(first_debug.get("first_company_block"))
+
+            st.markdown("**Sample parsed line items (first 10):**")
+            st.json(first_debug.get("first_items"))
+
+        # Excel download
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
             df.to_excel(writer, index=False, sheet_name="Quotes")
-
         buffer.seek(0)
 
         st.download_button(
